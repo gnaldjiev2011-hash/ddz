@@ -2,12 +2,20 @@
 
 Пускане:  streamlit run app.py
 Нужна версия: streamlit >= 1.27   (pip install -U streamlit)
+
+Ключовете могат да се въвеждат в страничния панел или да се задават като
+променливи на средата: OPENWEATHER_API_KEY, ACCUWEATHER_API_KEY, GOOGLE_MAPS_API_KEY
 """
+import os
 import random
+import tempfile
 import time
+from pathlib import Path
 
 import pandas as pd
+import requests
 import streamlit as st
+import streamlit.components.v1 as components
 
 st.set_page_config(page_title="Температурен помощник", page_icon="🌡️",
                    initial_sidebar_state="expanded")
@@ -49,6 +57,22 @@ ZONES = [
 
 PRESETS = {"❄️ -10°": -10.0, "🌧️ 8°": 8.0, "🍃 18°": 18.0, "☀️ 28°": 28.0, "🔥 38°": 38.0}
 
+# Източници на време и къде се търси ключът им (None = ключ не трябва)
+OPEN_METEO = "Open-Meteo (без ключ)"
+OWM = "OpenWeatherMap (безплатен ключ)"
+ACCU = "AccuWeather (ключ, 14 дни безплатно)"
+KEY_ENV = {OPEN_METEO: None, OWM: "OPENWEATHER_API_KEY", ACCU: "ACCUWEATHER_API_KEY"}
+
+HELP = (
+    "**OpenWeatherMap** (безплатен): регистрация на [openweathermap.org](https://openweathermap.org), "
+    "после *API keys*. Новият ключ се активира до 2 часа.\n\n"
+    "**AccuWeather**: акаунт на [developer.accuweather.com](https://developer.accuweather.com). "
+    "Безплатният пробен период е 14 дни, после е платен.\n\n"
+    "**Google Maps**: в [Google Cloud](https://console.cloud.google.com) включи *Maps JavaScript API* "
+    "и създай ключ от *Credentials*. Иска платежен метод, а първите 10 000 зареждания на месец са безплатни.\n\n"
+    "Open-Meteo и картата на OpenStreetMap работят без ключове."
+)
+
 # ───────────────────── Стилове и анимации ─────────────────────
 CSS = """
 <style>
@@ -75,6 +99,7 @@ CSS = """
 .chip{display:inline-block;margin:4px 6px 4px 0;padding:7px 14px;border-radius:99px;
   background:rgba(128,128,128,.14);border:1px solid rgba(128,128,128,.28)}
 div.stButton>button{width:100%;border-radius:12px}
+iframe{border-radius:16px}
 
 @keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-10px)}}
 @keyframes slide{from{left:0}}
@@ -85,6 +110,87 @@ div.stButton>button{width:100%;border-radius:12px}
 @media (prefers-reduced-motion:reduce){.p{display:none}.hero .big,.pin{animation:none}}
 </style>
 """
+
+# ───────────────────── Карта (компонент) ─────────────────────
+# Google Maps, ако има ключ; иначе (или при грешка в ключа) OpenStreetMap.
+# Натискане върху картата връща {lat, lng} към Python.
+MAP_HTML = r"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>html,body,#map{height:100%;margin:0}</style>
+</head><body><div id="map"></div>
+<script>
+const send = (type, data) => window.parent.postMessage({isStreamlitMessage: true, type, ...data}, "*");
+const load = (src) => new Promise((ok, fail) => {
+  const s = document.createElement("script");
+  s.src = src; s.onload = ok; s.onerror = fail; document.head.appendChild(s);
+});
+let args = {}, map = null, marker = null, mode = "osm", started = false;
+
+function pick(lat, lng) {
+  put(lat, lng);
+  send("streamlit:setComponentValue", {value: {lat, lng, ts: Date.now()}, dataType: "json"});
+}
+function put(lat, lng, label) {
+  if (!map) return;
+  if (mode === "google") {
+    marker = marker || new google.maps.Marker({map});
+    marker.setPosition({lat, lng});
+    if (label) marker.setTitle(label);
+  } else {
+    marker = marker || L.marker([lat, lng]).addTo(map);
+    marker.setLatLng([lat, lng]);
+    if (label) marker.bindPopup(label).openPopup();
+  }
+}
+async function startOsm() {
+  mode = "osm"; marker = null;
+  document.getElementById("map").innerHTML = "";
+  if (!window.L) await load("https://unpkg.com/leaflet@1.9.4/dist/leaflet.js");
+  map = L.map("map").setView(args.center, args.zoom);
+  L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+              {maxZoom: 19, attribution: "&copy; OpenStreetMap"}).addTo(map);
+  map.on("click", (e) => { const p = e.latlng.wrap(); pick(p.lat, p.lng); });
+}
+function startGoogle() {
+  return new Promise((ok, fail) => {
+    window.gm_authFailure = () => startOsm();
+    window.__gm = () => {
+      mode = "google";
+      map = new google.maps.Map(document.getElementById("map"), {
+        center: {lat: args.center[0], lng: args.center[1]}, zoom: args.zoom,
+        streetViewControl: false, mapTypeControl: false});
+      map.addListener("click", (e) => pick(e.latLng.lat(), e.latLng.lng()));
+      ok();
+    };
+    load("https://maps.googleapis.com/maps/api/js?key=" + encodeURIComponent(args.google_key)
+         + "&callback=__gm").catch(fail);
+  });
+}
+window.addEventListener("message", async (e) => {
+  if (e.data.type !== "streamlit:render") return;
+  args = e.data.args;
+  if (!started) {
+    started = true;
+    try { if (args.google_key) await startGoogle(); else await startOsm(); }
+    catch (err) { await startOsm(); }
+  }
+  if (args.marker) put(args.marker.lat, args.marker.lng, args.marker.label);
+});
+send("streamlit:componentReady", {apiVersion: 1});
+send("streamlit:setFrameHeight", {height: 420});
+</script></body></html>"""
+
+
+def map_component(google_key, marker):
+    folder = Path(tempfile.gettempdir()) / "temp_helper_map"
+    folder.mkdir(exist_ok=True)
+    page = folder / "index.html"
+    if not page.exists() or page.read_text(encoding="utf-8") != MAP_HTML:
+        page.write_text(MAP_HTML, encoding="utf-8")
+    comp = components.declare_component("temp_helper_map", path=str(folder))
+    return comp(google_key=google_key, center=[42.7, 25.4], zoom=7, marker=marker,
+                key=f"map_{bool(google_key)}", default=None)
 
 
 # ───────────────────── Изчисления ─────────────────────
@@ -125,6 +231,93 @@ def feels_like(t, wind, rh):
 def hydration(t):
     """Ориентировъчно количество вода за деня (литри)."""
     return round(2 + max(0.0, t - 20) * 0.1, 1)
+
+
+# ───────────────────── Време от интернет ─────────────────────
+def place_name(lat, lon):
+    """Име на място по координати (OpenStreetMap Nominatim)."""
+    try:
+        r = requests.get("https://nominatim.openstreetmap.org/reverse",
+                         params={"lat": lat, "lon": lon, "format": "jsonv2", "zoom": 10,
+                                 "accept-language": "bg"},
+                         headers={"User-Agent": "temperature-helper-streamlit/1.0"}, timeout=8)
+        a = r.json().get("address", {})
+        return a.get("city") or a.get("town") or a.get("village") or a.get("municipality")
+    except (requests.RequestException, ValueError):
+        return None
+
+
+def fetch_open_meteo(lat, lon, key):
+    r = requests.get("https://api.open-meteo.com/v1/forecast", timeout=10, params={
+        "latitude": lat, "longitude": lon, "timezone": "auto",
+        "current": "temperature_2m,relative_humidity_2m,wind_speed_10m"})
+    r.raise_for_status()
+    c = r.json()["current"]
+    return dict(temp=c["temperature_2m"], humidity=c["relative_humidity_2m"],
+                wind=c["wind_speed_10m"], place=None, text=None)
+
+
+def fetch_owm(lat, lon, key):
+    r = requests.get("https://api.openweathermap.org/data/2.5/weather", timeout=10, params={
+        "lat": lat, "lon": lon, "appid": key, "units": "metric", "lang": "bg"})
+    r.raise_for_status()
+    d = r.json()
+    return dict(temp=d["main"]["temp"], humidity=d["main"]["humidity"],
+                wind=d.get("wind", {}).get("speed", 0) * 3.6,  # м/с -> км/ч
+                place=d.get("name") or None, text=(d.get("weather") or [{}])[0].get("description"))
+
+
+def fetch_accu(lat, lon, key):
+    base = "https://dataservice.accuweather.com"
+    auth = {"headers": {"Authorization": f"Bearer {key}"}, "timeout": 10}
+    loc = requests.get(f"{base}/locations/v1/cities/geoposition/search", **auth,
+                       params={"apikey": key, "q": f"{lat},{lon}", "language": "bg"})
+    loc.raise_for_status()
+    loc = loc.json()
+    cur = requests.get(f"{base}/currentconditions/v1/{loc['Key']}", **auth,
+                       params={"apikey": key, "details": "true", "language": "bg"})
+    cur.raise_for_status()
+    c = cur.json()[0]
+    return dict(temp=c["Temperature"]["Metric"]["Value"], humidity=c.get("RelativeHumidity") or 50,
+                wind=c.get("Wind", {}).get("Speed", {}).get("Metric", {}).get("Value", 0),
+                place=loc.get("LocalizedName"), text=c.get("WeatherText"))
+
+
+FETCHERS = {OPEN_METEO: fetch_open_meteo, OWM: fetch_owm, ACCU: fetch_accu}
+
+
+def get_weather(provider, lat, lon, key):
+    """Връща (данни, грешка)."""
+    if KEY_ENV[provider] and not key:
+        return None, "Въведи API ключ в страничния панел или избери Open-Meteo."
+    try:
+        return FETCHERS[provider](lat, lon, key), None
+    except requests.HTTPError as e:
+        code = e.response.status_code
+        if code == 401:
+            return None, "Ключът е невалиден (нов ключ на OpenWeatherMap се активира до 2 часа)."
+        if code in (403, 429, 503):
+            return None, "Ключът няма достъп или лимитът на заявките е изчерпан."
+        return None, f"Сървърът върна грешка {code}."
+    except (requests.RequestException, KeyError, IndexError, ValueError):
+        return None, "Не успях да взема времето. Провери интернет връзката и опитай пак."
+
+
+def apply_weather(data, click, provider):
+    """Запазва резултата; слайдерите се обновяват при следващото пускане."""
+    lat, lng = click["lat"], click["lng"]
+    place = data["place"] or place_name(lat, lng) or f"{lat:.2f}°, {lng:.2f}°"
+    clamp = lambda v, lo, hi: max(lo, min(hi, v))
+    st.session_state.pending = {
+        "temp": clamp(round(data["temp"] * 2) / 2, -30.0, 50.0) + 0.0,
+        "wind": int(clamp(round(data["wind"]), 0, 100)),
+        "humidity": int(clamp(round(data["humidity"]), 0, 100)),
+    }
+    st.session_state.marker = {"lat": lat, "lng": lng, "label": f"{place}: {data['temp']:g}°C"}
+    extra = f" · {data['text']}" if data.get("text") else ""
+    st.session_state.map_msg = ("success",
+        f"📍 {place}: {data['temp']:g} °C{extra} · вятър {data['wind']:.0f} км/ч · "
+        f"влажност {data['humidity']:.0f}% ({provider.split()[0]})")
 
 
 # ───────────────────── HTML компоненти ─────────────────────
@@ -194,16 +387,32 @@ def run_check(temp, fl, zone, effects, typing):
 def main():
     st.markdown(CSS, unsafe_allow_html=True)
     st.session_state.setdefault("temp", 20.0)
+    st.session_state.setdefault("wind", 0)
+    st.session_state.setdefault("humidity", 50)
     st.session_state.setdefault("history", [])
+    # данните от картата се прилагат, преди да се създадат слайдерите
+    st.session_state.update(st.session_state.pop("pending", {}))
 
     st.title("🌡️ Температурен помощник")
 
     with st.sidebar:
         st.header("⚙️ Настройки")
-        wind = st.slider("💨 Вятър (км/ч)", 0, 100, 0)
-        humidity = st.slider("💧 Влажност (%)", 0, 100, 50)
+        wind = st.slider("💨 Вятър (км/ч)", 0, 100, key="wind")
+        humidity = st.slider("💧 Влажност (%)", 0, 100, key="humidity")
         effects = st.toggle("🎈 Ефекти (сняг, балони)", value=True)
         typing = st.toggle("⌨️ Ефект на писане", value=True)
+
+        st.header("🌦️ Данни за времето")
+        provider = st.selectbox("Източник", list(KEY_ENV))
+        env = KEY_ENV[provider]
+        api_key = ""
+        if env:
+            api_key = st.text_input(f"🔑 Ключ за {provider.split()[0]}", type="password",
+                                    value=os.getenv(env, ""))
+        google_key = st.text_input("🗺️ Google Maps ключ (по избор)", type="password",
+                                   value=os.getenv("GOOGLE_MAPS_API_KEY", ""))
+        with st.expander("❓ Как да взема ключ?"):
+            st.markdown(HELP)
 
     temp = st.slider("Температура (°C)", -30.0, 50.0, step=0.5, key="temp")
     for col, (label, value) in zip(st.columns(len(PRESETS)), PRESETS.items()):
@@ -223,6 +432,24 @@ def main():
 
     if st.button("🔍 Провери", type="primary"):
         run_check(temp, fl, zone, effects, typing)
+
+    st.subheader("🗺️ Времето от картата")
+    st.caption("Натисни къде да е върху картата — температурата, вятърът и влажността се зареждат сами.")
+    click = map_component(google_key, st.session_state.get("marker"))
+    if click and click != st.session_state.get("last_click"):
+        st.session_state.last_click = click
+        with st.spinner("Взимам времето..."):
+            data, error = get_weather(provider, click["lat"], click["lng"], api_key)
+        if error:
+            st.session_state.map_msg = ("error", error)
+        else:
+            apply_weather(data, click, provider)
+            st.rerun()
+    kind, text = st.session_state.get("map_msg", (None, None))
+    if text:
+        getattr(st, kind)(text)
+    if provider == OPEN_METEO:
+        st.caption("Weather data by [Open-Meteo.com](https://open-meteo.com/)")
 
     tab1, tab2, tab3 = st.tabs(["👕 Съвети", "🔄 Конвертор", "📜 История"])
 
